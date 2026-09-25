@@ -20,10 +20,12 @@ const stepNotes = [
 ] as const;
 
 export type TestType = "mos" | "sus" | "combined";
+export type TestLanguage = "id" | "en" | "zh";
 
 type LoadedConfig = {
   name?: string;
   test_type?: TestType;
+  language?: TestLanguage;
   audio?: Record<string, unknown>;
   pages?: Array<Record<string, unknown>>;
   mos?: {
@@ -173,7 +175,8 @@ function serializeConfig(
   calibrationAudioRef: string | null,
   mosPrompt?: string,
   scaleId?: number | null,
-  scaleName?: string | null
+  scaleName?: string | null,
+  language: TestLanguage = "id"
 ): string {
   const labels =
     existingLabels.length === mosMax - mosMin + 1
@@ -183,6 +186,7 @@ function serializeConfig(
   const lines = [
     `name: ${yamlQuote(name)}`,
     `test_type: ${testType}`,
+    `language: ${language}`,
     ...serializeAudioMap(audio),
   ];
 
@@ -239,6 +243,7 @@ function NewTestWizard() {
   );
   const [name, setName] = useState("");
   const [testType, setTestType] = useState<TestType>("mos");
+  const [language, setLanguage] = useState<TestLanguage>("id");
   const [scalePresets, setScalePresets] = useState<MOSScalePresetItem[]>([]);
   const [selectedPresetId, setSelectedPresetId] = useState<string>("");
   const [mosPrompt, setMosPrompt] = useState<string>("Rate the naturalness of the speech on a scale from 1 to 5.");
@@ -383,6 +388,9 @@ function NewTestWizard() {
       const config = payload.config;
       if (config) {
         setName(config.name ?? "");
+        if (config.language && ["id", "en", "zh"].includes(config.language)) {
+          setLanguage(config.language as TestLanguage);
+        }
         if (config.test_type) {
           setTestType(config.test_type === ("mos_sus" as string) ? "combined" : config.test_type);
         } else {
@@ -524,7 +532,8 @@ function NewTestWizard() {
       calibrationAudioRef || null,
       mosPrompt.trim(),
       scaleId,
-      scaleName
+      scaleName,
+      language
     );
     let response = testId
       ? await adminRequest(`/admin/api/tests/${testId}`, {
@@ -665,7 +674,8 @@ function NewTestWizard() {
       calibrationAudioRef || null,
       mosPrompt.trim(),
       scaleId,
-      scaleName
+      scaleName,
+      language
     );
 
     const patchResponse = await adminRequest(`/admin/api/tests/${testId}`, {
@@ -970,6 +980,18 @@ function NewTestWizard() {
               <option value="mos">MOS (Mean Opinion Score)</option>
               <option value="sus">SUS (Semantically Unpredictable Sentences)</option>
               <option value="combined">MOS + SUS (Combined)</option>
+            </Select>
+          </label>
+          <label>
+            Audio language
+            <Select
+              value={language}
+              onChange={(event) => setLanguage(event.target.value as TestLanguage)}
+              required
+            >
+              <option value="id">Indonesian (Bahasa Indonesia)</option>
+              <option value="en">English</option>
+              <option value="zh">Chinese / Mandarin (中文)</option>
             </Select>
           </label>
 
@@ -1474,6 +1496,14 @@ function NewTestWizard() {
                       ? "SUS"
                       : "MOS + SUS"}
                   </dd>
+                  <dt>Audio language</dt>
+                  <dd>
+                    {language === "id"
+                      ? "Indonesian"
+                      : language === "en"
+                      ? "English"
+                      : "Chinese / Mandarin"}
+                  </dd>
                 </dl>
               </section>
 
@@ -1738,7 +1768,8 @@ function NewTestWizard() {
                   calibrationAudioRef || null,
                   mosPrompt.trim(),
                   scaleId,
-                  scaleName
+                  scaleName,
+                  language
                 );
                 const patchResponse = await adminRequest(`/admin/api/tests/${testId}`, {
                   method: "PATCH",
