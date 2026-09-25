@@ -79,12 +79,15 @@ session using a saved server-side seed.
 A blind-leak test must inspect every respondent-facing endpoint and include a
 positive control showing protected administrator records retain engine data.
 
-## 7. WAcc Scoring
+## 7. WAcc / CAcc Scoring
 
-WAcc equals `1 - WER`. Store raw transcription separately from normalized
-transcription. Normalize Indonesian text with lowercase conversion, punctuation
-removal, whitespace normalization, and supported Arabic-numeral-to-Indonesian-
-word conversion. Report substitutions, deletions, and insertions.
+WAcc equals `1 - WER` (or CAcc equals `1 - CER` for Chinese). Store raw transcription separately from normalized
+transcription. Text normalization and scoring supports three configurable languages:
+- **Indonesian (`id`)**: Lowercase conversion, punctuation removal, whitespace normalization, and Arabic-numeral-to-Indonesian-word conversion. Word-level Levenshtein alignment (WAcc).
+- **English (`en`)**: Lowercase conversion, punctuation removal, whitespace normalization, and Arabic-numeral-to-English-word conversion. Word-level Levenshtein alignment (WAcc).
+- **Chinese / Mandarin (`zh`)**: Lowercase conversion, punctuation removal, Arabic-numeral-to-Mandarin-character conversion, and CJK character-level tokenization. Character-level Levenshtein alignment (CAcc/CER).
+
+Report substitutions, deletions, and insertions (S/D/I breakdown) across all supported languages.
 
 ## 8. Administrator Requirements
 

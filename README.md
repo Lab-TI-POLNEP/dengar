@@ -19,7 +19,7 @@ Production-ready standalone release consolidated around FastAPI and Next.js.
 - Single-password administrator console.
 - Configurable MOS scales and SUS playback quotas.
 - Blind stimulus presentation and reproducible randomization.
-- Indonesian WAcc scoring with S/D/I breakdown.
+- Multilingual SUS intelligibility scoring (Indonesian, English, and Chinese/Mandarin) with WAcc/CAcc and S/D/I breakdown.
 - Docker Compose deployment.
 
 ## Stack
