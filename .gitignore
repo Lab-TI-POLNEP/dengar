@@ -1,0 +1,58 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+*.egg-info/
+uv.lock
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
+*.tsbuildinfo
+
+# Runtime data — never commit
+/data/*
+!/data/.gitkeep
+/backend/instance/
+/backend/*.sqlite*
+*.db
+*.sqlite
+*.sqlite3
+
+# User assets and generated records
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+*.zip
+*.tar.gz
+*.xlsx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Documentation / LaTeX artifacts
+*.aux
+*.bbl
+*.blg
+*.log
+

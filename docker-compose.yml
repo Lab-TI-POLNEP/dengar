@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dengar-backend
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "4101:5000"
+    environment:
+      - DATA_DIR=/data
+      - SESSION_COOKIE_SECURE=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        BACKEND_ORIGIN: http://backend:5000
+        NEXT_PUBLIC_BACKEND_ORIGIN: ${NEXT_PUBLIC_BACKEND_ORIGIN:-}
+    container_name: dengar-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      - BACKEND_ORIGIN=http://backend:5000
+      - NEXT_PUBLIC_BACKEND_ORIGIN=${NEXT_PUBLIC_BACKEND_ORIGIN:-}
+    ports:
+      - "3101:3000"
+    restart: unless-stopped
+
+volumes:
+  data:

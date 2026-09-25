@@ -1,0 +1,31 @@
+# Ruff configuration for the Dengar backend.
+# Pinned explicitly so CI lint output does not drift with ruff's default rule set.
+line-length = 140
+target-version = "py311"
+
+[lint]
+select = [
+    "E4",      # pycodestyle: import block
+    "E7",      # pycodestyle: statement / comparison
+    "E9",      # pycodestyle: runtime errors
+    "F",       # pyflakes
+    "I",       # isort
+    "ASYNC230",# blocking file I/O inside async defs
+    "B008",    # function call in argument default
+    "BLE001",  # blind except
+    "C414",    # unnecessary double cast
+    "S110",    # try-except-pass
+    "SIM102",  # collapsible if
+    "SIM117",  # nested with statements
+    "SIM118",  # key in dict instead of dict.keys()
+    "UP035",   # deprecated import
+    "UP037",   # quoted annotation
+]
+
+# DTZ003 (datetime.utcnow) stays out of select on purpose: switching to
+# datetime.now(timezone.utc) changes the values stored in existing TIMESTAMP
+# columns, so it needs a data migration and a column review first.
+
+[lint.per-file-ignores]
+# Imports must follow the sys.path bootstrap, so they cannot sit at the top.
+"backend/migrations/env.py" = ["E402"]

@@ -1,0 +1,45 @@
+[project]
+name = "dengar-backend"
+version = "0.1.0"
+description = "Dengar FastAPI Backend"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.6",
+    "SQLAlchemy==2.0.31",
+    "uvicorn==0.34.0",
+    "argon2-cffi==25.1.0",
+    "itsdangerous==2.2.0",
+    "PyYAML==6.0.2",
+    "python-dotenv==1.0.0",
+    "openpyxl==3.1.5",
+    "python-multipart==0.0.32",
+    "httpx==0.28.1",
+    "alembic==1.19.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.3",
+    "pytest-asyncio==0.23.3",
+    "httpx==0.28.1",
+    "ruff==0.16.8",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["backend/app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["app*"]

@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+build
+dist
+coverage
+tests
+vitest.config.ts
+vitest-result.json
+tsconfig.tsbuildinfo
+*.log
+.env*
+Dockerfile
+.dockerignore

@@ -1,0 +1,19 @@
+name: Offline Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  static-offline-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject prohibited remote runtime patterns
+        run: |
+          ! grep -RInE 'https?://|//fonts\.|googleapis|googletagmanager|analytics' \
+            backend frontend docker-compose.yml .env.example \
+            --exclude-dir=node_modules --exclude-dir=.next \
+            --exclude-dir=.pytest_cache --exclude=package-lock.json \
+            --exclude=next-env.d.ts --exclude=*.tsbuildinfo --exclude=*.log | grep -v 'localhost'
+
+# M10 replaces this conservative static check with build and browser network audits.

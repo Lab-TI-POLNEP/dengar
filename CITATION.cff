@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "Dengar"
+message: "Please cite Dengar if you use this platform in research."
+type: software
+authors:
+  - family-names: "Wibowo"
+    given-names: "Fitri"
+repository-code: "https://github.com/Lab-TI-POLNEP/dengar"
+license: MIT
+version: "0.1.0"
+date-released: "2026-09-25"
