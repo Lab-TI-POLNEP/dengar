@@ -5,6 +5,16 @@ All notable changes to Dengar are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-25
+
+### Added
+
+- **Multilingual SUS Scoring**: Added evaluation and text normalization support for English (`en`) and Standard Chinese / Mandarin (`zh`) in addition to Indonesian (`id`).
+  - English number-to-words conversion (0 up to millions).
+  - Mandarin Chinese number-to-character conversion and CJK character-level tokenization for Character Error Rate (CER) and Character Accuracy (CAcc) evaluation.
+  - Test-level `language` configuration attribute in YAML test specification (`id`, `en`, `zh`).
+  - Audio language selection dropdown in the Admin Test Setup wizard and review summary card.
+
 ## [0.1.0] - 2026-09-25
 
 Initial open-source release of Dengar, an offline-first subjective speech evaluation platform.
