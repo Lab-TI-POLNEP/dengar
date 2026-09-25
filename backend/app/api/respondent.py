@@ -881,8 +881,9 @@ async def submit_response(request: Request):
                     # Scoring must not fail the submission; fall back to an empty reference.
                     logger.warning("reference transcription lookup failed: %s", exc)
 
-                stats = compute_word_stats(reference_text, raw_text)
-                normalized_text = normalize_text(raw_text)
+                language = config.get("language", "id")
+                stats = compute_word_stats(reference_text, raw_text, language=language)
+                normalized_text = normalize_text(raw_text, language=language)
 
                 sus_responses = _table(session, "sus_response")
                 existing_response = session.execute(

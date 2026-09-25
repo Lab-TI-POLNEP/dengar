@@ -11,7 +11,7 @@ class ConfigValidationError(ValueError):
         super().__init__("; ".join(errors))
 
 
-ROOT_KEYS = {"name", "test_type", "audio", "pages", "mos", "sus", "calibration_audio_ref"}
+ROOT_KEYS = {"name", "test_type", "language", "audio", "pages", "mos", "sus", "calibration_audio_ref"}
 PAGE_KEYS = {"kind", "title", "stimuli", "fields"}
 PAGE_ORDER = ["consent", "demographics", "mos", "sus", "completion"]
 
@@ -31,6 +31,9 @@ def parse_config(text: str) -> dict[str, Any]:
     test_type = value.get("test_type")
     if test_type is not None and (not isinstance(test_type, str) or test_type not in ("mos", "sus", "combined", "mos_sus")):
         errors.append("test_type: must be 'mos', 'sus', or 'combined'")
+    language = value.get("language")
+    if language is not None and (not isinstance(language, str) or language not in ("id", "en", "zh")):
+        errors.append("language: must be 'id', 'en', or 'zh'")
     audio = value.get("audio")
     if not isinstance(audio, dict):
         errors.append("audio: required mapping")
@@ -101,7 +104,7 @@ def parse_config(text: str) -> dict[str, Any]:
 
 
 def dump_config(config: dict[str, Any]) -> str:
-    return yaml.safe_dump(config, sort_keys=False, allow_unicode=False)
+    return yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
 
 
 def rebuild_pages(pages: list[Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:

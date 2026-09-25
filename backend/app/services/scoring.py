@@ -1,8 +1,14 @@
-"""Text normalization and word accuracy scoring for SUS evaluation.
+"""Text normalization and word/character accuracy scoring for SUS evaluation.
 
-Provides Indonesian number-to-words conversion, Unicode text normalization,
-and Levenshtein word-level alignment for computing Word Error Rate (WER) and
-Word Accuracy (WAcc).
+Provides multi-language number-to-words conversion, Unicode text normalization,
+and Levenshtein word-level (or character-level for Chinese) alignment for
+computing Word Error Rate (WER) / Character Error Rate (CER) and
+Word Accuracy (WAcc) / Character Accuracy (CAcc).
+
+Supported languages:
+  - id: Indonesian (word-level, WAcc/WER)
+  - en: English (word-level, WAcc/WER)
+  - zh: Chinese/Mandarin (character-level, CAcc/CER)
 """
 
 from __future__ import annotations
@@ -11,6 +17,13 @@ import math
 import re
 import unicodedata
 from typing import Any
+
+# Supported language codes for SUS scoring normalization.
+SUPPORTED_LANGUAGES = ("id", "en", "zh")
+
+# ---------------------------------------------------------------------------
+# Indonesian number-to-words
+# ---------------------------------------------------------------------------
 
 _INDONESIAN_NUMBERS = (
     "nol", "satu", "dua", "tiga", "empat", "lima",
@@ -41,33 +54,180 @@ def _indonesian_number(value: int) -> str:
     return str(value)
 
 
-def normalize_text(text: str | None) -> str:
-    """Normalize text for WAcc scoring.
+# ---------------------------------------------------------------------------
+# English number-to-words
+# ---------------------------------------------------------------------------
 
-    Normalization rules:
-    1. Convert to lowercase (case-insensitive comparison).
-    2. Strip punctuation by replacing non-alphanumeric and non-space characters with space.
-       Replacing with space prevents accidentally joining words (e.g. "word1.word2" -> "word1 word2").
-    3. Split on whitespace and rejoin with a single space (condenses multiple spaces and strips outer spaces).
-    """
+_ENGLISH_ONES = (
+    "zero", "one", "two", "three", "four", "five",
+    "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen",
+)
+_ENGLISH_TENS = (
+    "", "", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety",
+)
+
+
+def _english_number(value: int) -> str:
+    if value < 20:
+        return _ENGLISH_ONES[value]
+    if value < 100:
+        tens, remainder = divmod(value, 10)
+        return _ENGLISH_TENS[tens] + (f" {_ENGLISH_ONES[remainder]}" if remainder else "")
+    if value < 1000:
+        hundreds, remainder = divmod(value, 100)
+        return f"{_ENGLISH_ONES[hundreds]} hundred" + (f" {_english_number(remainder)}" if remainder else "")
+    if value < 1_000_000:
+        thousands, remainder = divmod(value, 1000)
+        return f"{_english_number(thousands)} thousand" + (f" {_english_number(remainder)}" if remainder else "")
+    if value < 1_000_000_000:
+        millions, remainder = divmod(value, 1_000_000)
+        return f"{_english_number(millions)} million" + (f" {_english_number(remainder)}" if remainder else "")
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Chinese (Mandarin) number-to-characters
+# ---------------------------------------------------------------------------
+
+_CHINESE_DIGITS = "零一二三四五六七八九"
+_CHINESE_UNITS = ("", "十", "百", "千")
+_CHINESE_GROUP_UNITS = ("", "万", "亿")
+
+
+def _chinese_group_segment(group: int) -> str:
+    """Convert a 4-digit group (0-9999) to Chinese characters."""
+    if group == 0:
+        return ""
+
+    units = ("", "十", "百", "千")
+    digits = [int(c) for c in str(group)]
+    num_digits = len(digits)
+
+    parts: list[str] = []
+    zero_pending = False
+
+    for i, d in enumerate(digits):
+        pos = num_digits - 1 - i
+        if d == 0:
+            if parts:
+                zero_pending = True
+        else:
+            if zero_pending:
+                parts.append("零")
+                zero_pending = False
+            parts.append(_CHINESE_DIGITS[d] + units[pos])
+
+    return "".join(parts)
+
+
+def _chinese_number(value: int) -> str:
+    """Convert an integer to Mandarin Chinese characters (simplified)."""
+    if value < 0:
+        return f"负{_chinese_number(-value)}"
+    if value < 10:
+        return _CHINESE_DIGITS[value]
+    if value >= 1_000_000_000:
+        return " ".join(_CHINESE_DIGITS[int(d)] for d in str(value))
+
+    parts: list[str] = []
+    group_index = 0
+    prev_had_zero = False
+
+    while value > 0:
+        group = value % 10000
+        value //= 10000
+
+        if group == 0:
+            group_index += 1
+            prev_had_zero = True
+            continue
+
+        segment = _chinese_group_segment(group)
+        unit = _CHINESE_GROUP_UNITS[group_index] if group_index < len(_CHINESE_GROUP_UNITS) else ""
+
+        if prev_had_zero and parts:
+            parts.append("零")
+
+        parts.append(unit)
+        parts.append(segment)
+
+        if group < 1000 and value > 0 and not prev_had_zero:
+            parts.append("零")
+
+        prev_had_zero = False
+        group_index += 1
+
+    result = "".join(reversed(parts))
+    if result.startswith("一十") and len(result) <= 3:
+        result = result[1:]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CJK character detection and tokenization
+# ---------------------------------------------------------------------------
+
+_CJK_RE = re.compile(
+    r"[\u4e00-\u9fff"           # CJK Unified Ideographs
+    r"\u3400-\u4dbf"            # CJK Extension A
+    r"\uf900-\ufaff"            # CJK Compatibility Ideographs
+    r"\U00020000-\U0002a6df"    # CJK Extension B
+    r"\U0002a700-\U0002b73f"    # CJK Extension C
+    r"\U0002b740-\U0002b81f"    # CJK Extension D
+    r"]"
+)
+
+
+def _tokenize_chinese(text: str) -> list[str]:
+    """Tokenize Chinese text into individual characters for CER evaluation."""
+    spaced = _CJK_RE.sub(lambda m: f" {m.group()} ", text)
+    return spaced.split()
+
+
+# ---------------------------------------------------------------------------
+# Number-to-words dispatch
+# ---------------------------------------------------------------------------
+
+_NUMBER_CONVERTERS: dict[str, Any] = {
+    "id": _indonesian_number,
+    "en": _english_number,
+    "zh": _chinese_number,
+}
+
+
+# ---------------------------------------------------------------------------
+# Text normalization
+# ---------------------------------------------------------------------------
+
+def normalize_text(text: str | None, language: str = "id") -> str:
+    """Normalize text for WAcc/CAcc scoring."""
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", str(text)).lower()
     text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r"\d+", lambda match: _indonesian_number(int(match.group())), text)
+
+    converter = _NUMBER_CONVERTERS.get(language)
+    if converter is not None:
+        text = re.sub(r"\d+", lambda match: converter(int(match.group())), text)
+
+    if language == "zh":
+        tokens = _tokenize_chinese(text)
+        return " ".join(tokens)
+
     return " ".join(text.split())
 
 
-def compute_word_stats(ref_text: str, hyp_text: str) -> dict[str, Any]:
-    """Calculate WER, WAcc, and alignment counts (S, D, I).
+# ---------------------------------------------------------------------------
+# Word/character accuracy scoring (Levenshtein alignment)
+# ---------------------------------------------------------------------------
 
-    WER is (substitutions + deletions + insertions) / reference words and
-    WAcc is 1 - WER. Empty references use WER 0 for an empty hypothesis and 1
-    otherwise.
-    Uses dynamic programming for Levenshtein distance/alignment at the word level.
-    """
-    ref_words = normalize_text(ref_text).split()
-    hyp_words = normalize_text(hyp_text).split()
+def compute_word_stats(ref_text: str, hyp_text: str, language: str = "id") -> dict[str, Any]:
+    """Calculate WER/CER, WAcc/CAcc, and alignment counts (S, D, I)."""
+    ref_words = normalize_text(ref_text, language).split()
+    hyp_words = normalize_text(hyp_text, language).split()
 
     n = len(ref_words)
     m = len(hyp_words)
@@ -145,7 +305,7 @@ def compute_word_stats(ref_text: str, hyp_text: str) -> dict[str, Any]:
 
 
 def sample_stddev(values: list[float]) -> float:
-    """Calculate sample standard deviation with Bessel's correction (n - 1)."""
+    """Calculate sample standard deviation with Bessel correction (n - 1)."""
     n = len(values)
     if n < 2:
         return 0.0
