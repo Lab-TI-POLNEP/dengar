@@ -4,11 +4,11 @@ import pytest
 
 from backend.app.services.config_service import ConfigValidationError, parse_config
 from backend.app.services.scoring import (
+    _chinese_number,
+    _english_number,
+    _indonesian_number,
     compute_word_stats,
     normalize_text,
-    _indonesian_number,
-    _english_number,
-    _chinese_number,
 )
 
 
