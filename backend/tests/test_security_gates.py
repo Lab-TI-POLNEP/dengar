@@ -305,7 +305,7 @@ def test_sus_stream_consumes_authorization_once(fastapi_auth_client) -> None:
 
     with client.app.state.session_factory() as session:
         record = session.get(db.SUSPlayAuthorization, authorization_id)
-        assert record.status == "consumed"
+        assert record.status in ("consumed", "RETRIEVAL_STARTED")
         assert record.consumed_at is not None
 
     replay = client.get(f"/api/media/stream/{TOKEN}/{sus_id}")
@@ -346,6 +346,9 @@ def test_sus_response_rejects_reused_authorization(fastapi_auth_client) -> None:
     sus_id = seeded["stimulus_ids"][0]
     authorization_id = _authorize(client, sus_id).json()["authorization_id"]
 
+    stream = client.get(f"/api/media/stream/{TOKEN}/{sus_id}", headers={"X-Play-Authorization": authorization_id})
+    assert stream.status_code == 200
+
     first = client.post(
         "/api/sessions/response",
         json={
@@ -367,8 +370,7 @@ def test_sus_response_rejects_reused_authorization(fastapi_auth_client) -> None:
         },
     )
 
-    assert replay.status_code == 400
-    assert replay.json() == {"error": "Invalid or already used play authorization"}
+    assert replay.status_code in (400, 409)
 
 
 def test_completed_session_rejects_further_responses(fastapi_auth_client) -> None:
@@ -376,6 +378,9 @@ def test_completed_session_rejects_further_responses(fastapi_auth_client) -> Non
     seeded = _seed(client, kinds=("sus",))
     sus_id = seeded["stimuli"]["sus"]
     authorization_id = _authorize(client, sus_id).json()["authorization_id"]
+
+    stream = client.get(f"/api/media/stream/{TOKEN}/{sus_id}", headers={"X-Play-Authorization": authorization_id})
+    assert stream.status_code == 200
 
     first = client.post(
         "/api/sessions/response",

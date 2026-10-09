@@ -229,12 +229,12 @@ sus:
         )
         session.add(so)
 
-        # Create authorized play
+        # Create authorized play in RETRIEVAL_STARTED state
         auth = db.SUSPlayAuthorization(
             id="auth-zh-token-123",
             session_id=rs.id,
             stimulus_id=stimulus.id,
-            status="authorized",
+            status="RETRIEVAL_STARTED",
         )
         session.add(auth)
         session.commit()
