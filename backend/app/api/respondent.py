@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
 import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import MetaData, Table, func, select, update
+from sqlalchemy import MetaData, Table, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as DBTimeoutError
 
 from ..core.security import rate_limited
+from ..models import Base
 from ..services.config_service import ConfigValidationError, parse_config
 from ..services.media_service import resolve_stored_path, stream_media_file
-from ..services.scoring import compute_word_stats, normalize_text
+from ..services.sus_service import (
+    StorageContentionError,
+    authorize_sus_playback,
+    claim_sus_retrieval,
+    is_first_unanswered,
+    preflight_sus_retrieval,
+    submit_sus_response,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -30,7 +41,9 @@ def utcnow() -> datetime:
 
 
 def _table(session, name: str) -> Table:
-    return Table(name, MetaData(), autoload_with=session.bind)
+    if name in Base.metadata.tables:
+        return Base.metadata.tables[name]
+    return Table(name, MetaData(), autoload_with=session.connection())
 
 
 def _options(value: str | None) -> list[Any]:
@@ -593,6 +606,7 @@ async def authorize_sus_play(request: Request):
     payload = await _json_payload(request)
     token = payload.get("token")
     stimulus_id = payload.get("stimulus_id")
+    idempotency_key = request.headers.get("Idempotency-Key") or payload.get("idempotency_key")
     if not isinstance(token, str) or not token:
         return JSONResponse(_INVALID_SESSION, status_code=400)
     if isinstance(stimulus_id, bool) or not isinstance(stimulus_id, int):
@@ -635,53 +649,30 @@ async def authorize_sus_play(request: Request):
             if stimulus["kind"] != "sus":
                 return JSONResponse({"error": "Stimulus is not a SUS item"}, status_code=400)
 
-            config = parse_config(test["config_yaml"])
-            calibration_audio_ref = config.get("calibration_audio_ref")
-            if (
-                isinstance(calibration_audio_ref, str)
-                and calibration_audio_ref in config.get("audio", {})
-                and not rs["calibration_completed"]
-            ):
-                return JSONResponse({"error": "Calibration required"}, status_code=400)
-
-            quota = config.get("sus", {}).get("quota", 2)
-            if type(quota) is not int or quota < 1:
-                return JSONResponse({"error": "Invalid SUS quota configuration"}, status_code=500)
-
-            sus_play_authorizations = _table(session, "sus_play_authorization")
-            used = session.execute(
-                select(func.count(sus_play_authorizations.c.id)).where(
-                    sus_play_authorizations.c.session_id == rs["id"],
-                    sus_play_authorizations.c.stimulus_id == stimulus_id,
-                )
-            ).scalar() or 0
-
-            if used >= quota:
-                return JSONResponse(
-                    {"error": "SUS playback quota exceeded", "quota": quota},
-                    status_code=429,
-                )
-
-            authorization_id = secrets.token_urlsafe(32)
-            session.execute(
-                sus_play_authorizations.insert().values(
-                    id=authorization_id,
-                    session_id=rs["id"],
-                    stimulus_id=stimulus_id,
-                    status="authorized",
-                    created_at=utcnow(),
-                )
+            status_code, resp_data = authorize_sus_playback(
+                session, rs, test, stimulus_id, idempotency_key=idempotency_key
             )
-
+            return JSONResponse(resp_data, status_code=status_code)
+    except DBTimeoutError:
+        return JSONResponse(
+            {"error": "Database connection pool timeout, server busy"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except StorageContentionError:
+        return JSONResponse(
+            {"error": "Storage contention, please retry"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except SQLAlchemyError as exc:
+        msg = str(exc).lower()
+        if "busy" in msg or "locked" in msg:
             return JSONResponse(
-                {
-                    "authorization_id": authorization_id,
-                    "quota": quota,
-                    "plays_used": used,
-                },
-                status_code=201,
+                {"error": "Storage contention, please retry"},
+                status_code=503,
+                headers={"Retry-After": "1"},
             )
-    except SQLAlchemyError:
         return JSONResponse({"error": "internal server error"}, status_code=500)
 
 
@@ -736,6 +727,42 @@ async def submit_response(request: Request):
             if requires_calibration and not rs["calibration_completed"]:
                 return JSONResponse({"error": "Calibration required"}, status_code=400)
 
+            # Allow exact successful submission replay with Idempotency-Key even if session completed
+            idempotency_key = request.headers.get("Idempotency-Key") or payload.get("idempotency_key")
+            if stimulus_id is not None and idempotency_key:
+                raw_text = payload.get("transcription")
+                if raw_text is None:
+                    raw_text = payload.get("raw_transcription")
+                if raw_text is None:
+                    raw_text = ""
+                cleaned = str(raw_text or "").strip()
+                auth_id_candidate = payload.get("authorization_id") or ""
+                req_fingerprint = hashlib.sha256(
+                    f"{stimulus_id}:{auth_id_candidate}:{cleaned}".encode("utf-8")
+                ).hexdigest()
+
+                sus_responses = _table(session, "sus_response")
+                existing_resp = session.execute(
+                    select(sus_responses).where(
+                        sus_responses.c.session_id == rs["id"],
+                        sus_responses.c.stimulus_id == stimulus_id,
+                        sus_responses.c.idempotency_key == idempotency_key,
+                    )
+                ).mappings().first()
+                if existing_resp:
+                    if existing_resp.get("request_hash") and existing_resp["request_hash"] != req_fingerprint:
+                        return JSONResponse({"error": "Idempotency key already used with different payload"}, status_code=409)
+                    return JSONResponse({
+                        "status": "success",
+                        "message": "Response saved (idempotent replay)",
+                        "data": {
+                            "wacc": existing_resp["wacc"],
+                            "substitutions": existing_resp["substitutions"],
+                            "deletions": existing_resp["deletions"],
+                            "insertions": existing_resp["insertions"],
+                        },
+                    }, status_code=200)
+
             if rs["status"] == "completed":
                 return JSONResponse({"error": "Session is already completed"}, status_code=400)
 
@@ -757,6 +784,9 @@ async def submit_response(request: Request):
                 return JSONResponse({"error": "Stimulus not found"}, status_code=404)
 
             if stimulus["kind"] == "mos":
+                if not is_first_unanswered(session, rs["id"], stimulus_id):
+                    return JSONResponse({"error": "Stimulus not yet available"}, status_code=403)
+
                 if rating is None:
                     return JSONResponse({"error": "rating is required for MOS stimulus"}, status_code=400)
                 if isinstance(rating, bool) or (
@@ -814,117 +844,26 @@ async def submit_response(request: Request):
                     )
 
             elif stimulus["kind"] == "sus":
-                quota = config.get("sus", {}).get("quota", 2)
-                if type(quota) is not int or quota < 1:
-                    return JSONResponse({"error": "Invalid SUS quota configuration"}, status_code=500)
-
-                sus_play_authorizations = _table(session, "sus_play_authorization")
-                prior_plays = session.execute(
-                    select(func.count(sus_play_authorizations.c.id)).where(
-                        sus_play_authorizations.c.session_id == rs["id"],
-                        sus_play_authorizations.c.stimulus_id == stimulus_id,
-                        sus_play_authorizations.c.status == "consumed",
-                    )
-                ).scalar() or 0
-
                 if not isinstance(authorization_id, str) or not authorization_id:
                     return JSONResponse({"error": "A valid play authorization is required"}, status_code=400)
-
-                authorization = session.execute(
-                    select(sus_play_authorizations).where(
-                        sus_play_authorizations.c.id == authorization_id,
-                        sus_play_authorizations.c.session_id == rs["id"],
-                        sus_play_authorizations.c.stimulus_id == stimulus_id,
-                        sus_play_authorizations.c.status == "authorized",
-                    )
-                ).mappings().first()
-
-                if authorization is None:
-                    return JSONResponse({"error": "Invalid or already used play authorization"}, status_code=400)
-
-                consumed_time = utcnow()
-                consume_result = session.execute(
-                    update(sus_play_authorizations)
-                    .where(
-                        sus_play_authorizations.c.id == authorization_id,
-                        sus_play_authorizations.c.status == "authorized",
-                    )
-                    .values(
-                        status="consumed",
-                        consumed_at=consumed_time,
-                    )
-                )
-                if consume_result.rowcount == 0:
-                    return JSONResponse({"error": "Invalid or already used play authorization"}, status_code=400)
-
-                prior_plays += 1
 
                 raw_text = payload.get("transcription")
                 if raw_text is None:
                     raw_text = payload.get("raw_transcription")
                 if raw_text is None:
                     raw_text = ""
-                raw_text = str(raw_text).strip()
+                idempotency_key = request.headers.get("Idempotency-Key") or payload.get("idempotency_key")
 
-                reference_text = ""
-                try:
-                    audio_map = config.get("audio", {})
-                    asset_id = audio_map.get(stimulus["audio_ref"])
-                    if asset_id:
-                        audio_assets = _table(session, "audio_asset")
-                        asset = session.execute(
-                            select(audio_assets).where(audio_assets.c.id == asset_id)
-                        ).mappings().first()
-                        if asset:
-                            reference_text = asset["reference_transcription"] or ""
-                except (SQLAlchemyError, KeyError, TypeError) as exc:
-                    # Scoring must not fail the submission; fall back to an empty reference.
-                    logger.warning("reference transcription lookup failed: %s", exc)
-
-                language = config.get("language", "id")
-                stats = compute_word_stats(reference_text, raw_text, language=language)
-                normalized_text = normalize_text(raw_text, language=language)
-
-                sus_responses = _table(session, "sus_response")
-                existing_response = session.execute(
-                    select(sus_responses).where(
-                        sus_responses.c.session_id == rs["id"],
-                        sus_responses.c.stimulus_id == stimulus_id,
-                    )
-                ).mappings().first()
-
-                if existing_response:
-                    session.execute(
-                        update(sus_responses)
-                        .where(
-                            sus_responses.c.session_id == rs["id"],
-                            sus_responses.c.stimulus_id == stimulus_id,
-                        )
-                        .values(
-                            raw_transcription=raw_text,
-                            normalized_transcription=normalized_text,
-                            wacc=stats["wacc"],
-                            substitutions=stats["substitutions"],
-                            deletions=stats["deletions"],
-                            insertions=stats["insertions"],
-                            play_count=prior_plays,
-                        )
-                    )
-                else:
-                    session.execute(
-                        sus_responses.insert().values(
-                            session_id=rs["id"],
-                            stimulus_id=stimulus_id,
-                            raw_transcription=raw_text,
-                            normalized_transcription=normalized_text,
-                            wacc=stats["wacc"],
-                            substitutions=stats["substitutions"],
-                            deletions=stats["deletions"],
-                            insertions=stats["insertions"],
-                            play_count=prior_plays,
-                            created_at=utcnow(),
-                        )
-                    )
+                status_code, resp_data = submit_sus_response(
+                    session,
+                    rs,
+                    test,
+                    stimulus,
+                    authorization_id,
+                    raw_text,
+                    idempotency_key=idempotency_key,
+                )
+                return JSONResponse(resp_data, status_code=status_code)
             else:
                 return JSONResponse({"error": "Invalid stimulus kind"}, status_code=400)
 
@@ -963,7 +902,26 @@ async def submit_response(request: Request):
                 )
 
             return JSONResponse({"status": "success", "message": "Response saved"})
-    except SQLAlchemyError:
+    except DBTimeoutError:
+        return JSONResponse(
+            {"error": "Database connection pool timeout, server busy"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except StorageContentionError:
+        return JSONResponse(
+            {"error": "Storage contention, please retry"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except SQLAlchemyError as exc:
+        msg = str(exc).lower()
+        if "busy" in msg or "locked" in msg:
+            return JSONResponse(
+                {"error": "Storage contention, please retry"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         return JSONResponse({"error": "internal server error"}, status_code=500)
 
 
@@ -1015,7 +973,20 @@ async def public_calibration_stream(request: Request):
             return JSONResponse({"error": "invalid storage reference"}, status_code=500)
 
         return stream_media_file(request, path, content_type, stored_filename)
-    except SQLAlchemyError:
+    except StorageContentionError:
+        return JSONResponse(
+            {"error": "Storage contention, please retry"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except SQLAlchemyError as exc:
+        msg = str(exc).lower()
+        if "busy" in msg or "locked" in msg:
+            return JSONResponse(
+                {"error": "Storage contention, please retry"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         return JSONResponse({"error": "internal server error"}, status_code=500)
 
 
@@ -1194,53 +1165,85 @@ async def public_stream_audio(request: Request, token: str, stimulus_id: int):
             if not stimulus:
                 return JSONResponse({"error": "Stimulus not found"}, status_code=404)
 
-            # For SUS stimuli, require and atomically consume a valid play authorization.
-            # Each authorization allows exactly one stream, enforcing the quota.
+            # For SUS stimuli, validate preflight, handle non-consuming HEAD, and claim one-time retrieval.
             if stimulus["kind"] == "sus":
-                sus_play_authorizations = _table(session, "sus_play_authorization")
-                authorization = session.execute(
-                    select(sus_play_authorizations).where(
-                        sus_play_authorizations.c.session_id == rs["id"],
-                        sus_play_authorizations.c.stimulus_id == stimulus_id,
-                        sus_play_authorizations.c.status == "authorized",
+                if request.headers.get("range"):
+                    return JSONResponse(
+                        {"error": "Range requests not supported for SUS evaluation"},
+                        status_code=416,
+                        headers={"Content-Range": "bytes */0"},
                     )
-                ).mappings().first()
-                if authorization is None:
-                    return JSONResponse({"error": "Play authorization required"}, status_code=403)
 
-                # Atomically consume the authorization
-                result = session.execute(
-                    update(sus_play_authorizations)
-                    .where(
-                        sus_play_authorizations.c.id == authorization["id"],
-                        sus_play_authorizations.c.status == "authorized",
-                    )
-                    .values(status="consumed", consumed_at=utcnow())
+                auth_id = request.headers.get("X-Play-Authorization") or request.query_params.get("authorization_id")
+                storage_dir = Path(request.app.state.settings.audio_storage_path)
+                code, err_data, target_path, content_type, stored_filename, resolved_auth_id = preflight_sus_retrieval(
+                    session, rs, test, stimulus, storage_dir, auth_id
                 )
-                if result.rowcount == 0:
-                    return JSONResponse({"error": "Play authorization required"}, status_code=403)
+                if code != 200:
+                    return JSONResponse(err_data, status_code=code)
+                assert target_path is not None
+                assert resolved_auth_id is not None
+
+                if request.method == "HEAD":
+                    return Response(
+                        status_code=200,
+                        headers={
+                            "Content-Type": content_type or "audio/wav",
+                            "Content-Length": str(target_path.stat().st_size),
+                            "Accept-Ranges": "bytes",
+                        },
+                    )
+
+                claimed = claim_sus_retrieval(session, resolved_auth_id, rs["id"], stimulus_id)
+                if not claimed:
+                    return JSONResponse({"error": "Play authorization already used"}, status_code=403)
                 session.commit()
+                out_path = target_path
+                out_content_type = content_type or "audio/wav"
+                out_filename = stored_filename or target_path.name
+            else:
+                audio_map = config.get("audio", {})
+                asset_id = audio_map.get(stimulus["audio_ref"])
+                if not asset_id:
+                    return JSONResponse({"error": "Audio asset mapping not found"}, status_code=404)
 
-            audio_map = config.get("audio", {})
-            asset_id = audio_map.get(stimulus["audio_ref"])
-            if not asset_id:
-                return JSONResponse({"error": "Audio asset mapping not found"}, status_code=404)
+                audio_assets = _table(session, "audio_asset")
+                asset = session.execute(
+                    select(audio_assets).where(audio_assets.c.id == asset_id)
+                ).mappings().first()
+                if not asset or asset["status"] != "active":
+                    return JSONResponse({"error": "Audio asset not found or inactive"}, status_code=404)
 
-            audio_assets = _table(session, "audio_asset")
-            asset = session.execute(
-                select(audio_assets).where(audio_assets.c.id == asset_id)
-            ).mappings().first()
-            if not asset or asset["status"] != "active":
-                return JSONResponse({"error": "Audio asset not found or inactive"}, status_code=404)
+                stored_filename = asset["stored_filename"]
+                content_type = asset["content_type"]
 
-            stored_filename = asset["stored_filename"]
-            content_type = asset["content_type"]
+                storage_dir = request.app.state.settings.audio_storage_path
+                path = resolve_stored_path(storage_dir, stored_filename)
+                if path is None:
+                    return JSONResponse({"error": "invalid storage reference"}, status_code=500)
+                out_path = path
+                out_content_type = content_type
+                out_filename = stored_filename
 
-        storage_dir = request.app.state.settings.audio_storage_path
-        path = resolve_stored_path(storage_dir, stored_filename)
-        if path is None:
-            return JSONResponse({"error": "invalid storage reference"}, status_code=500)
-
-        return stream_media_file(request, path, content_type, stored_filename)
-    except SQLAlchemyError:
+        return stream_media_file(request, out_path, out_content_type, out_filename)
+    except DBTimeoutError:
+        return JSONResponse(
+            {"error": "Database connection pool timeout, server busy"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except StorageContentionError:
+        return JSONResponse(
+            {"error": "Storage contention, please retry"},
+            status_code=503,
+            headers={"Retry-After": "1"},
+        )
+    except SQLAlchemyError as exc:
+        msg = str(exc).lower()
+        if "busy" in msg or "locked" in msg:
+            return JSONResponse(
+                {"error": "Storage contention, please retry"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         return JSONResponse({"error": "internal server error"}, status_code=500)

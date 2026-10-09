@@ -21,14 +21,21 @@ ALEMBIC_VERSION_DDL = (
 def create_database_engine(database_url: str) -> Engine:
     is_sqlite = database_url.startswith("sqlite")
     connect_args = {"check_same_thread": False} if is_sqlite else {}
-    engine = create_engine(database_url, future=True, connect_args=connect_args)
-
+    engine_kwargs = {"future": True, "connect_args": connect_args}
     if is_sqlite and database_url != "sqlite:///:memory:":
+        engine_kwargs["pool_size"] = 10
+        engine_kwargs["max_overflow"] = 20
+        engine_kwargs["pool_timeout"] = 10.0
+    engine = create_engine(database_url, **engine_kwargs)
+
+    if is_sqlite:
         @event.listens_for(engine, "connect")
         def configure_sqlite_connection(dbapi_connection, _connection_record):
             cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            if database_url != "sqlite:///:memory:":
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=5000")
             cursor.close()
 
     return engine

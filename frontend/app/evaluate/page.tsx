@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import PageShell from "@/components/PageShell";
 import Button from "@/components/Button";
 import Textarea from "@/components/Textarea";
+import { generateIdempotencyKey } from "../../lib/idempotency";
 
 const backendOrigin = process.env.NEXT_PUBLIC_BACKEND_ORIGIN ?? "";
 
@@ -40,6 +41,30 @@ type ApiErrorResponse = {
   error?: string;
 };
 
+type SubmissionPayload = {
+  token: string;
+  stimulus_id: number;
+  rating?: number;
+  play_count?: number;
+  authorization_id?: string;
+  transcription?: string;
+  idempotency_key?: string;
+};
+
+type PendingSubmission = {
+  idempotencyKey: string;
+  token: string;
+  stimulusId: number;
+  authorizationId?: string;
+  payload: SubmissionPayload;
+};
+
+function safeRevokeObjectURL(url: string | null) {
+  if (url && typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export default function EvaluatePage() {
   const router = useRouter();
   const [sessionToken, setSessionToken] = useState("");
@@ -47,8 +72,12 @@ export default function EvaluatePage() {
   // Loading & error states
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState("");
+  const [submissionError, setSubmissionError] = useState("");
   const [susSubmitError, setSusSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [pendingSubmission, setPendingSubmission] = useState<PendingSubmission | null>(null);
+  const pendingSubmissionRef = useRef<PendingSubmission | null>(null);
+  const submissionInFlightRef = useRef(false);
   
   // Evaluation step states
   const [testName, setTestName] = useState("");
@@ -72,11 +101,10 @@ export default function EvaluatePage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const susAudioRef = useRef<HTMLAudioElement | null>(null);
   const susObjectUrlRef = useRef<string | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const bufferRef = useRef<AudioBuffer | null>(null);
   const playbackOffsetRef = useRef(0);
   const authorizationInFlightRef = useRef(false);
   const initialLoadStartedRef = useRef(false);
+  const [atLeastOneCompletedPlayback, setAtLeastOneCompletedPlayback] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -106,7 +134,11 @@ export default function EvaluatePage() {
   async function loadNextStimulus(token: string) {
     setLoading(true);
     setErrorMsg("");
+    setSubmissionError("");
     setSusSubmitError("");
+    setPendingSubmission(null);
+    pendingSubmissionRef.current = null;
+    submissionInFlightRef.current = false;
     // Reset audio player states
     setIsPlaying(false);
     setCurrentTime(0);
@@ -120,12 +152,9 @@ export default function EvaluatePage() {
       susAudioRef.current.src = "";
     }
     if (susObjectUrlRef.current) {
-      URL.revokeObjectURL(susObjectUrlRef.current);
+      safeRevokeObjectURL(susObjectUrlRef.current);
       susObjectUrlRef.current = null;
     }
-    sourceRef.current?.stop();
-    sourceRef.current = null;
-    bufferRef.current = null;
     playbackOffsetRef.current = 0;
     setSusAuthorizationId(null);
     setTranscription("");
@@ -159,6 +188,14 @@ export default function EvaluatePage() {
         setMosConfig(data.mos_config ?? null);
         setRating(null);
         setPlayCount(0);
+        setTranscription("");
+        setSusAuthorizationId(null);
+        setSusPlaybackState("idle");
+        setAtLeastOneCompletedPlayback(false);
+        if (susObjectUrlRef.current) {
+          safeRevokeObjectURL(susObjectUrlRef.current);
+          susObjectUrlRef.current = null;
+        }
       }
     } catch {
       setErrorMsg("Network error loading content. Please check your connection.");
@@ -186,28 +223,47 @@ export default function EvaluatePage() {
     setSusAuthorizationId(data.authorization_id);
     setSusQuota(data.quota ?? 0);
     setSusPlaysUsed(data.plays_used ?? 0);
+    return data as { authorization_id: string; quota: number; plays_used: number };
   }
 
   async function playSusAudio() {
-    if (!stimulus || stimulus.kind !== "sus" || authorizationInFlightRef.current || susPlaybackState === "playing" || susPlaybackState === "quota-exhausted") return;
+    if (!stimulus || stimulus.kind !== "sus" || authorizationInFlightRef.current || isPlaying || susPlaybackState === "authorizing") return;
+
+    // Direct resume without network call if audio is already paused
+    if (susPlaybackState === "paused" && susAudioRef.current && susObjectUrlRef.current) {
+      try {
+        await susAudioRef.current.play();
+        setIsPlaying(true);
+        setSusPlaybackState("playing");
+      } catch {
+        setErrorMsg("Unable to resume playback.");
+      }
+      return;
+    }
+
+    if (susPlaybackState === "quota-exhausted") return;
+
     authorizationInFlightRef.current = true;
     setSusPlaybackState("authorizing");
     try {
-      await authorizeSusPlay();
-      const response = await fetch(`${backendOrigin}/api/media/stream/${sessionToken}/${stimulus.id}`);
+      const authData = await authorizeSusPlay();
+      const response = await fetch(`${backendOrigin}/api/media/stream/${sessionToken}/${stimulus.id}`, {
+        headers: { "X-Play-Authorization": authData.authorization_id },
+      });
       if (!response.ok) throw new Error("Unable to load audio.");
       const objectUrl = URL.createObjectURL(new Blob([await response.arrayBuffer()]));
-      if (susObjectUrlRef.current) URL.revokeObjectURL(susObjectUrlRef.current);
+      if (susObjectUrlRef.current) safeRevokeObjectURL(susObjectUrlRef.current);
       susObjectUrlRef.current = objectUrl;
       const audio = susAudioRef.current;
       if (!audio) throw new Error("Unable to initialize audio player.");
       audio.src = objectUrl;
-      audio.currentTime = playbackOffsetRef.current;
+      audio.currentTime = 0;
       audio.onended = () => {
         playbackOffsetRef.current = 0;
         setIsPlaying(false);
         setCurrentTime(0);
         setSusPlaysUsed((used) => used + 1);
+        setAtLeastOneCompletedPlayback(true);
         setSusPlaybackState("completed");
       };
       await audio.play();
@@ -224,7 +280,7 @@ export default function EvaluatePage() {
 
   function pauseSusAudio() {
     const audio = susAudioRef.current;
-    if (!audio || susPlaybackState !== "playing") return;
+    if (!audio || !isPlaying) return;
     playbackOffsetRef.current = audio.currentTime;
     audio.pause();
     setIsPlaying(false);
@@ -271,45 +327,121 @@ export default function EvaluatePage() {
     }
   }
 
-  // Submit response
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!stimulus) return;
-    if (stimulus.kind === "mos" && rating === null) return;
+  // Prepare immutable snapshot for submission
+  function prepareSubmission(): PendingSubmission | null {
+    if (!stimulus) return null;
+    if (stimulus.kind === "mos" && rating === null) return null;
+    if (stimulus.kind === "sus" && (!susAuthorizationId || !atLeastOneCompletedPlayback || isPlaying)) return null;
 
+    const idempotencyKey = generateIdempotencyKey();
+    const payload: SubmissionPayload = {
+      token: sessionToken,
+      stimulus_id: stimulus.id,
+      rating: stimulus.kind === "mos" ? rating ?? undefined : undefined,
+      play_count: stimulus.kind === "mos" ? playCount : undefined,
+      authorization_id: stimulus.kind === "sus" ? susAuthorizationId ?? undefined : undefined,
+      transcription: stimulus.kind === "sus" ? transcription : undefined,
+      idempotency_key: idempotencyKey,
+    };
+
+    const snapshot: PendingSubmission = {
+      idempotencyKey,
+      token: sessionToken,
+      stimulusId: stimulus.id,
+      authorizationId: stimulus.kind === "sus" ? susAuthorizationId ?? undefined : undefined,
+      payload,
+    };
+
+    pendingSubmissionRef.current = snapshot;
+    setPendingSubmission(snapshot);
+    return snapshot;
+  }
+
+  // Transport function executing HTTP request with Idempotency-Key
+  async function executeSubmissionTransport(pending: PendingSubmission): Promise<{ ok: boolean; status?: number; error?: string }> {
+    if (submissionInFlightRef.current) {
+      return { ok: false, error: "Submission already in flight" };
+    }
+    submissionInFlightRef.current = true;
     setSubmitting(true);
     setErrorMsg("");
+    setSubmissionError("");
+    setSusSubmitError("");
 
     try {
       const resp = await fetch(`${backendOrigin}/api/sessions/response`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          token: sessionToken,
-          stimulus_id: stimulus.id,
-          rating: stimulus.kind === "mos" ? rating : undefined,
-          play_count: stimulus.kind === "mos" ? playCount : undefined,
-          authorization_id: stimulus.kind === "sus" ? susAuthorizationId : undefined,
-          transcription: stimulus.kind === "sus" ? transcription : undefined,
-        }),
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": pending.idempotencyKey,
+        },
+        body: JSON.stringify(pending.payload),
       });
-      const data = await resp.json() as { error?: string; status?: string };
+
+      let data: { error?: string; status?: string } = {};
+      try {
+        data = (await resp.json()) as { error?: string; status?: string };
+      } catch {
+        // Not JSON
+      }
+
       if (!resp.ok) {
-        if (stimulus.kind === "sus") {
-          setSusSubmitError(data.error ?? "Failed to submit response.");
+        const errMsg = data.error ?? "Failed to submit response.";
+        if (pending.payload.authorization_id || stimulus?.kind === "sus") {
+          setSusSubmitError(errMsg);
           setSusPlaybackState("error");
         } else {
-          setErrorMsg(data.error ?? "Failed to submit response.");
+          setSubmissionError(errMsg);
         }
-        return;
+        return { ok: false, status: resp.status, error: errMsg };
       }
-      
-      // Load next step
-      await loadNextStimulus(sessionToken);
+
+      // Success acknowledged: clear pending snapshot
+      pendingSubmissionRef.current = null;
+      setPendingSubmission(null);
+      return { ok: true, status: resp.status };
     } catch {
-      setErrorMsg("Network error saving response. Please try again.");
+      const networkErrMsg = "Network error saving response. Please retry submission.";
+      if (pending.payload.authorization_id || stimulus?.kind === "sus") {
+        setSusSubmitError(networkErrMsg);
+      } else {
+        setSubmissionError(networkErrMsg);
+      }
+      return { ok: false, error: networkErrMsg };
     } finally {
+      submissionInFlightRef.current = false;
       setSubmitting(false);
+    }
+  }
+
+  // Submit response handler
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (submitting || submissionInFlightRef.current) return;
+
+    if (pendingSubmissionRef.current) {
+      await handleRetrySubmission();
+      return;
+    }
+
+    const pending = prepareSubmission();
+    if (!pending) return;
+
+    const result = await executeSubmissionTransport(pending);
+    if (result.ok) {
+      await loadNextStimulus(sessionToken);
+    }
+  }
+
+  // Explicit retry handler reading the immutable pending snapshot
+  async function handleRetrySubmission() {
+    if (submitting || submissionInFlightRef.current) return;
+    const pending = pendingSubmissionRef.current;
+    if (!pending) return;
+
+    const result = await executeSubmissionTransport(pending);
+    if (result.ok) {
+      await loadNextStimulus(sessionToken);
     }
   }
 
@@ -464,6 +596,7 @@ export default function EvaluatePage() {
                             key={score}
                             type="button"
                             onClick={() => setRating(score)}
+                            disabled={submitting || !!pendingSubmission}
                             className={`mos-scale__dot ${isActive ? "mos-scale__dot--active" : ""}`}
                             style={{
                               flex: "1 1 0px",
@@ -474,7 +607,7 @@ export default function EvaluatePage() {
                               flexDirection: "column",
                               gap: "0.25rem",
                               alignItems: "center",
-                              cursor: "pointer",
+                              cursor: (submitting || !!pendingSubmission) ? "not-allowed" : "pointer",
                               transition: "all 150ms ease"
                             }}
                             aria-label={`Rate ${score}: ${label}`}
@@ -492,13 +625,34 @@ export default function EvaluatePage() {
                 )}
 
                 {/* Actions */}
+                {submissionError && (
+                  <div role="alert" style={{ marginBottom: "1rem" }}>
+                    <p style={{ color: "#991b1b", margin: "0 0 0.5rem", fontWeight: 600 }}>{submissionError}</p>
+                    {pendingSubmission && (
+                      <Button
+                        type="button"
+                        onClick={handleRetrySubmission}
+                        disabled={submitting}
+                        aria-label="Retry submission"
+                      >
+                        {submitting ? "Retrying..." : "Retry submission"}
+                      </Button>
+                    )}
+                  </div>
+                )}
                 <div style={{ display: "flex", justifyContent: "flex-end" }}>
                   <Button
                     type="submit"
                     disabled={rating === null || submitting}
-                    aria-label="Submit rating and continue"
+                    aria-label={pendingSubmission ? "Retry submission" : "Submit rating and continue"}
                   >
-                    {submitting ? "Saving..." : "Next"}
+                    {submitting
+                      ? pendingSubmission
+                        ? "Retrying..."
+                        : "Saving..."
+                      : pendingSubmission
+                      ? "Retry submission"
+                      : "Next"}
                   </Button>
                 </div>
               </form>
@@ -524,29 +678,79 @@ export default function EvaluatePage() {
                 </div>
                 <audio ref={susAudioRef} onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)} preload="auto" />
                 <p className="muted" style={{ margin: "0 0 1rem", fontWeight: 600 }}>Stimulus {stimulus.neutral_label}</p>
-                <button type="button" onClick={isPlaying ? pauseSusAudio : playSusAudio} disabled={susPlaybackState === "authorizing" || susPlaybackState === "quota-exhausted"} aria-label={isPlaying ? "Pause SUS audio" : "Play SUS audio"} style={{ width: "100%", minHeight: "3.25rem", border: 0, borderRadius: "12px", background: susPlaybackState === "quota-exhausted" ? "#cbd5e1" : "var(--color-primary)", color: "#fff", fontWeight: 800, fontSize: "1rem", cursor: susPlaybackState === "quota-exhausted" ? "not-allowed" : "pointer", boxShadow: "0 8px 18px rgba(79, 70, 229, .2)" }}>
+                <button
+                  type="button"
+                  onClick={isPlaying ? pauseSusAudio : playSusAudio}
+                  disabled={
+                    susPlaybackState === "authorizing" ||
+                    susPlaybackState === "quota-exhausted" ||
+                    submitting ||
+                    !!pendingSubmission
+                  }
+                  aria-label={isPlaying ? "Pause SUS audio" : "Play SUS audio"}
+                  style={{
+                    width: "100%",
+                    minHeight: "3.25rem",
+                    border: 0,
+                    borderRadius: "12px",
+                    background: susPlaybackState === "quota-exhausted" ? "#cbd5e1" : "var(--color-primary)",
+                    color: "#fff",
+                    fontWeight: 800,
+                    fontSize: "1rem",
+                    cursor: (susPlaybackState === "quota-exhausted" || !!pendingSubmission) ? "not-allowed" : "pointer",
+                    boxShadow: "0 8px 18px rgba(79, 70, 229, .2)"
+                  }}
+                >
                   {susPlaybackState === "authorizing" ? "Authorizing..." : isPlaying ? "Pause" : "Play"}
                 </button>
                 <label htmlFor="sus-transcription" style={{ display: "block", textAlign: "left", margin: "1.5rem 0 1rem" }}>Transcription</label>
-                <Textarea id="sus-transcription" value={transcription} onChange={(event) => setTranscription(event.target.value)} rows={4} />
+                <Textarea
+                  id="sus-transcription"
+                  value={transcription}
+                  onChange={(event) => setTranscription(event.target.value)}
+                  rows={4}
+                  disabled={!atLeastOneCompletedPlayback || isPlaying || submitting || !!pendingSubmission}
+                  placeholder={
+                    pendingSubmission
+                      ? "Submission pending retry..."
+                      : atLeastOneCompletedPlayback
+                      ? "Type what you heard (leave blank if unintelligible)..."
+                      : "Listen to the audio first before transcribing..."
+                  }
+                />
                 {susSubmitError && (
-                  <p role="alert" style={{ color: "#991b1b", margin: "1rem 0", fontWeight: 600 }}>{susSubmitError}</p>
+                  <div role="alert" style={{ margin: "1rem 0" }}>
+                    <p style={{ color: "#991b1b", margin: "0 0 0.5rem", fontWeight: 600 }}>{susSubmitError}</p>
+                    {pendingSubmission && (
+                      <Button
+                        type="button"
+                        onClick={handleRetrySubmission}
+                        disabled={submitting}
+                        aria-label="Retry submission"
+                      >
+                        {submitting ? "Retrying..." : "Retry submission"}
+                      </Button>
+                    )}
+                  </div>
                 )}
                 <div style={{ display: "flex", justifyContent: "center" }}>
                   <Button
                     type="submit"
                     disabled={
                       submitting ||
-                      !transcription.trim() ||
-                      (!susAuthorizationId && susPlaybackState !== "quota-exhausted") ||
-                      !(
-                        susPlaybackState === "completed" ||
-                        susPlaybackState === "quota-exhausted"
-                      )
+                      !susAuthorizationId ||
+                      !atLeastOneCompletedPlayback ||
+                      isPlaying
                     }
-                    aria-label="Submit transcription and continue"
+                    aria-label={pendingSubmission ? "Retry submission" : "Submit transcription and continue"}
                   >
-                    {submitting ? "Saving..." : "Continue"}
+                    {submitting
+                      ? pendingSubmission
+                        ? "Retrying..."
+                        : "Saving..."
+                      : pendingSubmission
+                      ? "Retry submission"
+                      : "Continue"}
                   </Button>
                 </div>
               </form>

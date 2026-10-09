@@ -199,6 +199,9 @@ class SUSResponse(Base):
     insertions = Column(Integer, nullable=True)
     play_count = Column(Integer, nullable=False, default=0)
     created_at = Column(TIMESTAMP(timezone=False), nullable=False, default=utcnow)
+    authorization_id = Column(String(64), ForeignKey("sus_play_authorization.id", ondelete="SET NULL"), nullable=True)
+    idempotency_key = Column(String(64), nullable=True)
+    request_hash = Column(String(64), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("session_id", "stimulus_id", name="uq_sus_response_session_stimulus"),
@@ -211,6 +214,13 @@ class SUSPlayAuthorization(Base):
     id = Column(String(64), primary_key=True)
     session_id = Column(Integer, ForeignKey("respondent_session.id", ondelete="CASCADE"), nullable=False)
     stimulus_id = Column(Integer, ForeignKey("test_stimulus.id", ondelete="CASCADE"), nullable=False)
-    status = Column(String(16), nullable=False, default="authorized")
+    status = Column(String(32), nullable=False, default="ISSUED")
     created_at = Column(TIMESTAMP(timezone=False), nullable=False, default=utcnow)
     consumed_at = Column(TIMESTAMP(timezone=False), nullable=True)
+    idempotency_key = Column(String(64), nullable=True)
+    request_hash = Column(String(64), nullable=True)
+    expires_at = Column(TIMESTAMP(timezone=False), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "stimulus_id", "idempotency_key", name="uq_sus_play_auth_session_stimulus_key"),
+    )
